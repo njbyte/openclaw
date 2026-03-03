@@ -1,4 +1,8 @@
+import { formatControlPlaneActor, resolveControlPlaneActor } from "./control-plane-audit.js";
+import { consumeControlPlaneWriteBudget } from "./control-plane-rate-limit.js";
+import { ADMIN_SCOPE, authorizeOperatorScopesForMethod } from "./method-scopes.js";
 import { ErrorCodes, errorShape } from "./protocol/index.js";
+import { isRoleAuthorizedForMethod, parseGatewayRole } from "./role-policy.js";
 import { agentHandlers } from "./server-methods/agent.js";
 import { agentsHandlers } from "./server-methods/agents.js";
 import { browserHandlers } from "./server-methods/browser.js";
@@ -8,16 +12,19 @@ import { configHandlers } from "./server-methods/config.js";
 import { connectHandlers } from "./server-methods/connect.js";
 import { cronHandlers } from "./server-methods/cron.js";
 import { deviceHandlers } from "./server-methods/devices.js";
+import { doctorHandlers } from "./server-methods/doctor.js";
 import { execApprovalsHandlers } from "./server-methods/exec-approvals.js";
 import { healthHandlers } from "./server-methods/health.js";
 import { logsHandlers } from "./server-methods/logs.js";
 import { modelsHandlers } from "./server-methods/models.js";
 import { nodeHandlers } from "./server-methods/nodes.js";
+import { pushHandlers } from "./server-methods/push.js";
 import { sendHandlers } from "./server-methods/send.js";
 import { sessionsHandlers } from "./server-methods/sessions.js";
 import { skillsHandlers } from "./server-methods/skills.js";
 import { systemHandlers } from "./server-methods/system.js";
 import { talkHandlers } from "./server-methods/talk.js";
+import { toolsCatalogHandlers } from "./server-methods/tools-catalog.js";
 import { ttsHandlers } from "./server-methods/tts.js";
 import type { GatewayRequestHandlers, GatewayRequestOptions } from "./server-methods/types.js";
 import { updateHandlers } from "./server-methods/update.js";
@@ -91,73 +98,34 @@ const WRITE_METHODS = new Set([
   "browser.request",
 ]);
 
+const CONTROL_PLANE_WRITE_METHODS = new Set(["config.apply", "config.patch", "update.run"]);
 function authorizeGatewayMethod(method: string, client: GatewayRequestOptions["client"]) {
   if (!client?.connect) {
     return null;
   }
-  const role = client.connect.role ?? "operator";
+  if (method === "health") {
+    return null;
+  }
+  const roleRaw = client.connect.role ?? "operator";
+  const role = parseGatewayRole(roleRaw);
+  if (!role) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${roleRaw}`);
+  }
   const scopes = client.connect.scopes ?? [];
-  if (NODE_ROLE_METHODS.has(method)) {
-    if (role === "node") {
-      return null;
-    }
+  if (!isRoleAuthorizedForMethod(role, method)) {
     return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${role}`);
   }
   if (role === "node") {
-    return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${role}`);
-  }
-  if (role !== "operator") {
-    return errorShape(ErrorCodes.INVALID_REQUEST, `unauthorized role: ${role}`);
+    return null;
   }
   if (scopes.includes(ADMIN_SCOPE)) {
     return null;
   }
-  if (APPROVAL_METHODS.has(method) && !scopes.includes(APPROVALS_SCOPE)) {
-    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.approvals");
+  const scopeAuth = authorizeOperatorScopesForMethod(method, scopes);
+  if (!scopeAuth.allowed) {
+    return errorShape(ErrorCodes.INVALID_REQUEST, `missing scope: ${scopeAuth.missingScope}`);
   }
-  if (PAIRING_METHODS.has(method) && !scopes.includes(PAIRING_SCOPE)) {
-    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.pairing");
-  }
-  if (READ_METHODS.has(method) && !(scopes.includes(READ_SCOPE) || scopes.includes(WRITE_SCOPE))) {
-    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.read");
-  }
-  if (WRITE_METHODS.has(method) && !scopes.includes(WRITE_SCOPE)) {
-    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.write");
-  }
-  if (APPROVAL_METHODS.has(method)) {
-    return null;
-  }
-  if (PAIRING_METHODS.has(method)) {
-    return null;
-  }
-  if (READ_METHODS.has(method)) {
-    return null;
-  }
-  if (WRITE_METHODS.has(method)) {
-    return null;
-  }
-  if (ADMIN_METHOD_PREFIXES.some((prefix) => method.startsWith(prefix))) {
-    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.admin");
-  }
-  if (
-    method.startsWith("config.") ||
-    method.startsWith("wizard.") ||
-    method.startsWith("update.") ||
-    method === "channels.logout" ||
-    method === "skills.install" ||
-    method === "skills.update" ||
-    method === "cron.add" ||
-    method === "cron.update" ||
-    method === "cron.remove" ||
-    method === "cron.run" ||
-    method === "sessions.patch" ||
-    method === "sessions.reset" ||
-    method === "sessions.delete" ||
-    method === "sessions.compact"
-  ) {
-    return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.admin");
-  }
-  return errorShape(ErrorCodes.INVALID_REQUEST, "missing scope: operator.admin");
+  return null;
 }
 
 export const coreGatewayHandlers: GatewayRequestHandlers = {
@@ -169,18 +137,21 @@ export const coreGatewayHandlers: GatewayRequestHandlers = {
   ...chatHandlers,
   ...cronHandlers,
   ...deviceHandlers,
+  ...doctorHandlers,
   ...execApprovalsHandlers,
   ...webHandlers,
   ...modelsHandlers,
   ...configHandlers,
   ...wizardHandlers,
   ...talkHandlers,
+  ...toolsCatalogHandlers,
   ...ttsHandlers,
   ...skillsHandlers,
   ...sessionsHandlers,
   ...systemHandlers,
   ...updateHandlers,
   ...nodeHandlers,
+  ...pushHandlers,
   ...sendHandlers,
   ...usageHandlers,
   ...agentHandlers,
@@ -196,6 +167,32 @@ export async function handleGatewayRequest(
   if (authError) {
     respond(false, undefined, authError);
     return;
+  }
+  if (CONTROL_PLANE_WRITE_METHODS.has(req.method)) {
+    const budget = consumeControlPlaneWriteBudget({ client });
+    if (!budget.allowed) {
+      const actor = resolveControlPlaneActor(client);
+      context.logGateway.warn(
+        `control-plane write rate-limited method=${req.method} ${formatControlPlaneActor(actor)} retryAfterMs=${budget.retryAfterMs} key=${budget.key}`,
+      );
+      respond(
+        false,
+        undefined,
+        errorShape(
+          ErrorCodes.UNAVAILABLE,
+          `rate limit exceeded for ${req.method}; retry after ${Math.ceil(budget.retryAfterMs / 1000)}s`,
+          {
+            retryable: true,
+            retryAfterMs: budget.retryAfterMs,
+            details: {
+              method: req.method,
+              limit: "3 per 60s",
+            },
+          },
+        ),
+      );
+      return;
+    }
   }
   const handler = opts.extraHandlers?.[req.method] ?? coreGatewayHandlers[req.method];
   if (!handler) {
